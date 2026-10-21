@@ -1,0 +1,44 @@
+# ISI-6271 WS2 — df_engine image build (Rust otap-dataflow v0.61.0).
+# Board direction 2026-10-19 (comment a818ef74): df_engine is a DISTINCT engine for
+# Arms C (OTLP) + D (OTAP) — "build a new image of df_engine". The genuinely distinct
+# otel-arrow engine (vs contrib) is the Rust OTAP Dataflow Engine (rust/otap-dataflow).
+#
+# This is a REPO-ROOT-context variant of the upstream rust/otap-dataflow/Dockerfile.
+# Upstream uses a BuildKit NAMED build-context (`--build-context otel-arrow=../../`)
+# to pull /proto + /rust/contrib from the repo root — kaniko does NOT support named
+# contexts, so this variant sources everything from a SINGLE context = the otel-arrow
+# repo root (the build Job git-clones the repo and sets context to its root).
+# Target paths match upstream exactly (/build/proto, /build/rust/contrib,
+# /build/rust/dataflow) so cross-arch-build.sh is unchanged.
+FROM --platform=$BUILDPLATFORM docker.io/rust:1.99 AS dataflow-build
+WORKDIR /build/rust/dataflow
+# kaniko sets these from --build-arg; default to amd64 (the observable-benchmark node arch).
+ARG BUILDPLATFORM=linux/amd64
+ARG TARGETPLATFORM=linux/amd64
+ENV BUILDPLATFORM=${BUILDPLATFORM} TARGETPLATFORM=${TARGETPLATFORM}
+
+RUN apt-get update && apt-get install -y protobuf-compiler
+
+# repo-root-relative COPYs (context = otel-arrow repo root), same target layout as upstream.
+COPY proto/opentelemetry/proto /build/proto/opentelemetry/proto
+COPY proto/opentelemetry-proto /build/proto/opentelemetry-proto
+COPY rust/contrib /build/rust/contrib
+COPY THIRD_PARTY_NOTICES.txt /build/THIRD_PARTY_NOTICES.txt
+COPY rust/otap-dataflow/. /build/rust/dataflow/.
+
+ARG RUSTFLAGS="-C target-cpu=native"
+ENV RUSTFLAGS=${RUSTFLAGS}
+ARG FEATURES
+ENV FEATURES=${FEATURES}
+
+# amd64==amd64 → cross-arch-build.sh skips the cross-gcc and does a native
+# `cargo build --locked --release --target x86_64-unknown-linux-gnu`, then
+# copies the binary to ./df_engine (what the runtime stage expects).
+RUN ./cross-arch-build.sh
+
+FROM gcr.io/distroless/cc-debian13:nonroot
+LABEL maintainer="isItObservable / ISI-6264 benchmark"
+WORKDIR /home/nonroot
+COPY --from=dataflow-build --chown=nonroot:nonroot /build/rust/dataflow/df_engine .
+USER nonroot
+ENTRYPOINT ["/home/nonroot/df_engine"]
