@@ -1,0 +1,87 @@
+# ISI-6271 WS2 — df_engine image build via GitHub Actions (board direction 2026-10-21, comment 2ad0757d).
+#
+# Why CI instead of in-cluster kaniko: the workflow's built-in GITHUB_TOKEN already carries
+# `packages: write` for the repo owner's GHCR namespace, so NO classic PAT is needed — this
+# removes the write:packages-PAT blocker entirely.
+#
+# Runs IN the fork (henrikrexed/otel-arrow) so GITHUB_TOKEN can push to ghcr.io/henrikrexed/*,
+# but checks the DATAFLOW SOURCES out of the UPSTREAM tag (open-telemetry/otel-arrow @
+# rust/otap-dataflow/v0.61.0). This is deliberate: GitHub's "Sync fork" syncs the default
+# branch but NOT upstream tags, so the fork does not carry the v0.61.0 tag — pulling sources
+# straight from upstream keeps the build reproducible without needing to mirror tags into the fork.
+#
+# The fork only needs TWO files on its default branch (main):
+#   - .github/workflows/build-df-engine.yml   (this file)
+#   - Dockerfile.df-engine                    (repo-root-context wrapper; from
+#                                              _artifacts/isi6271/manifests/build/Dockerfile.df-engine)
+name: build-df-engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream otel-arrow ref/tag to build"
+        required: false
+        default: "rust/otap-dataflow/v0.61.0"
+      tag:
+        description: "Image tag to publish"
+        required: false
+        default: "0.61.0"
+
+env:
+  IMAGE: ghcr.io/henrikrexed/df-engine
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # GITHUB_TOKEN gets packages:write — no PAT needed
+    steps:
+      - name: Checkout fork (wrapper Dockerfile lives here)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Checkout upstream dataflow sources at tag
+        uses: actions/checkout@v4
+        with:
+          repository: open-telemetry/otel-arrow
+          ref: ${{ github.event.inputs.upstream_ref || 'rust/otap-dataflow/v0.61.0' }}
+          path: src
+
+      - name: Stage wrapper Dockerfile into source root
+        run: cp fork/Dockerfile.df-engine src/Dockerfile.df-engine
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tag
+        id: meta
+        run: echo "tag=${{ github.event.inputs.tag || '0.61.0' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push df_engine
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src                      # otel-arrow repo root (matches kaniko repo-root context)
+          file: ./src/Dockerfile.df-engine    # repo-root-context wrapper Dockerfile
+          platforms: linux/amd64              # observable-benchmark node arch
+          push: true
+          provenance: false                   # single-arch image, keep the GHCR manifest simple to pull
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            BUILDPLATFORM=linux/amd64
+            TARGETPLATFORM=linux/amd64
+
+      - name: Summary
+        run: |
+          echo "Pushed ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "If the package is private, make it PUBLIC (or add a pull secret) so the benchmark cluster can pull it." >> "$GITHUB_STEP_SUMMARY"
